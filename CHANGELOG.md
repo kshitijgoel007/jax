@@ -28,6 +28,12 @@ Remember to align the itemized text with the first line of an item within a list
   * HLO lowering rules should no longer wrap singleton ir.Values in tuples.
     Instead, return singleton ir.Values unwrapped. Support for wrapped values
     will be removed in a future version of JAX.
+  * Hermetic CUDA support is added.
+    Hermetic CUDA uses a specific downloadable version of CUDA instead of the
+    user’s locally installed CUDA. Bazel will download CUDA, CUDNN and NCCL
+    distributions, and then use CUDA libraries and tools as dependencies in
+    various Bazel targets. This enables more reproducible builds for JAX and its
+    supported CUDA versions.
 
 ## jaxlib 0.4.31
 
