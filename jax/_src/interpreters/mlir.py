@@ -56,6 +56,7 @@ from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import func as func_dialect
 from jax._src.lib.mlir.dialects import hlo
 from jax._src.lib.mlir import register_jax_dialects
+from jax._src.sharding_impls import XLACompatibleSharding
 from jax._src.state.types import AbstractRef
 
 map, unsafe_map = util.safe_map, map
@@ -67,6 +68,13 @@ Value = Any  # = ir.Value
 
 # mypy implicitly sets this variable to true when type checking.
 MYPY = False
+
+_JAX_SDY_LOWER = config.bool_flag(
+    "jax_sdy_lower",
+    os.getenv("JAX_SDY_LOWER", False),
+    help="Whether to lower to Shardy. Shardy is a new open sourced propagation "
+         "framework for MLIR. Currently Shardy is experimental in JAX. See "
+         "www.github.com/openxla/shardy")
 
 _JAX_DUMP_IR_TO = config.string_flag(
     'jax_dump_ir_to', os.getenv('JAX_DUMP_IR_TO', ''),
@@ -496,6 +504,7 @@ def make_ir_context() -> ir.Context:
   # just disable threading.
   context.enable_multithreading(False)
 
+  dialects.sdy.register_dialect(context)
   dialects.mhlo.register_mhlo_dialect(context)
   dialects.chlo.register_dialect(context)
   dialects.hlo.register_dialect(context)
@@ -813,17 +822,21 @@ _platforms_with_donation = ["cpu", "cuda", "rocm", "tpu"]
 
 
 def _to_physical_op_sharding(
-    aval: core.AbstractValue, sharding: JSharding | None,
-) -> xc.OpSharding | None:
+    aval: core.AbstractValue,
+    sharding: XLACompatibleSharding | None,
+    ctx: ModuleContext,
+) -> xc.OpSharding | ir.Attribute | None:
   if sharding is None:
     return None
   assert isinstance(sharding, JSharding)
   if isinstance(aval, AbstractRef):
-    return _to_physical_op_sharding(aval.inner_aval, sharding)
+    return _to_physical_op_sharding(aval.inner_aval, sharding, ctx)
   assert isinstance(aval, (core.ShapedArray, core.DShapedArray))
   if dtypes.issubdtype(aval.dtype, dtypes.extended):
     sharding = sharding_impls.physical_sharding(aval, sharding)
     aval = core.physical_aval(aval)
+  if _JAX_SDY_LOWER.value:
+    return sharding._to_sdy_sharding(ctx, aval.ndim)
   return sharding._to_xla_hlo_sharding(aval.ndim).to_proto()  # type: ignore
 
 
@@ -868,6 +881,7 @@ def lower_jaxpr_to_module(
     input_output_aliases: None | tuple[int | None, ...] = None,
     propagated_out_mem_kinds: tuple[None | str, ...] | None = None,
     lowering_parameters: LoweringParameters,
+    mesh_shape: tuple[tuple[str, int], ...] | None = None,
 ) -> LoweringResult:
   """Lowers a top-level jaxpr to an MLIR module.
 
@@ -953,6 +967,15 @@ def lower_jaxpr_to_module(
     # Remove module name characters that XLA would alter. This ensures that
     # XLA computation preserves the module name.
     attrs = ctx.module.operation.attributes
+    if _JAX_SDY_LOWER.value and mesh_shape:
+      ctx.module.body.append(
+          dialects.sdy.MeshOp(
+              "mesh",
+              dialects.sdy.MeshAttr.get([
+                  dialects.sdy.MeshAxisAttr.get(name, size) for name, size in mesh_shape
+              ]),
+          )
+      )
     module_name = _module_name_regex.sub("_", module_name)
     attrs["sym_name"] = ir.StringAttr.get(module_name)
     attrs["mhlo.num_replicas"] = i32_attr(num_replicas)
@@ -1201,7 +1224,7 @@ def lower_jaxpr_to_fun(
   ir_arg_shardings = None
   if arg_shardings is not None:
     ir_arg_shardings = util.flatten(
-        [[_to_physical_op_sharding(a, s)] * len(types)
+        [[_to_physical_op_sharding(a, s, ctx)] * len(types)
          for a, s, types in zip(input_avals, arg_shardings, input_types)])
 
   ir_arg_memory_kinds = None
@@ -1222,9 +1245,10 @@ def lower_jaxpr_to_fun(
 
   ir_result_shardings = None
   if result_shardings is not None:
-    ir_result_shardings = util.flatten(
-        [[_to_physical_op_sharding(a, s)] * len(types)
-         for a, s, types in zip(output_avals, result_shardings, output_types)])
+    ir_result_shardings = util.flatten([
+        [_to_physical_op_sharding(a, s, ctx)] * len(types)
+        for a, s, types in zip(output_avals, result_shardings, output_types)
+    ])
 
   ir_result_memory_kinds = None
   custom_call_ir_result_memory_kinds = None
@@ -1275,7 +1299,8 @@ def lower_jaxpr_to_fun(
     if use_sharding_annotations and ir_arg_shardings is not None:
       for attrs, sharding in zip(arg_attrs, ir_arg_shardings):
         if sharding is not None:
-          attrs["mhlo.sharding"] = get_sharding_attr(sharding)
+          attrs[f"{'sdy' if _JAX_SDY_LOWER.value else 'mhlo'}.sharding"] = (
+              get_sharding_attr(sharding))
 
     if ir_arg_memory_kinds is not None:
       for attrs, memory_kind in zip(arg_attrs, ir_arg_memory_kinds):
@@ -1339,7 +1364,8 @@ def lower_jaxpr_to_fun(
   if use_sharding_annotations and ir_result_shardings is not None:
     for attrs, sharding in zip(result_attrs, ir_result_shardings):
       if sharding is not None:
-        attrs['mhlo.sharding'] = get_sharding_attr(sharding)
+        attrs[f"{'sdy' if _JAX_SDY_LOWER.value else 'mhlo'}.sharding"] = (
+            get_sharding_attr(sharding))
 
   if ir_result_memory_kinds is not None:
     for attrs, mem_kind in zip(result_attrs, ir_result_memory_kinds):
@@ -2172,18 +2198,30 @@ wrap_with_sharding_op = partial(_wrap_with_spmd_op, "Sharding")
 wrap_with_full_to_shard_op = partial(_wrap_with_spmd_op, "SPMDFullToShardShape")
 wrap_with_shard_to_full_op = partial(_wrap_with_spmd_op, "SPMDShardToFullShape")
 
-def set_sharding(op, sharding_proto: xc.OpSharding):
-  op.attributes["mhlo.sharding"] = get_sharding_attr(sharding_proto)
+
+def set_sharding(op, sharding_proto: xc.OpSharding | ir.Attribute):
+  op.attributes[f"{'sdy' if _JAX_SDY_LOWER.value else 'mhlo'}.sharding"] = (
+      get_sharding_attr(sharding_proto))
 
 
-def get_sharding_attr(sharding_proto: xc.OpSharding):
-  # If there are very large numbers of devices, use the proto representation.
-  # The MHLO to HLO conversion supports both, and the proto representation is
-  # more compact.
-  if len(sharding_proto.tile_assignment_devices) > 100:
-    return ir.StringAttr.get(sharding_proto.SerializeToString())  # type: ignore
+def get_sharding_attr(
+    sharding_proto: xc.OpSharding | ir.Attribute
+) -> ir.Attribute:
+  if isinstance(sharding_proto, ir.Attribute):
+    if not _JAX_SDY_LOWER.value:
+      raise ValueError(
+          "The sharding attribute is not an OpSharding proto. This is only "
+          "supported when --jax_sdy_lower=False."
+      )
+    return sharding_proto
   else:
-    return ir.StringAttr.get(repr(xc.HloSharding.from_proto(sharding_proto)))
+    # If there are very large numbers of devices, use the proto representation.
+    # The MHLO to HLO conversion supports both, and the proto representation is
+    # more compact.
+    if len(sharding_proto.tile_assignment_devices) > 100:
+      return ir.StringAttr.get(sharding_proto.SerializeToString())  # type: ignore
+    else:
+      return ir.StringAttr.get(repr(xc.HloSharding.from_proto(sharding_proto)))
 
 
 def wrap_with_layout_op(ctx: LoweringRuleContext,

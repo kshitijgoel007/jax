@@ -32,6 +32,7 @@ from jax._src import util
 from jax._src import xla_bridge
 from jax._src import core
 from jax._src.lib import xla_client as xc
+from jax._src.lib.mlir.dialects import sdy
 from jax._src.op_shardings import (
     are_op_shardings_equal, get_num_ways_dim_sharded, is_op_sharding_replicated)
 from jax._src.partition_spec import PartitionSpec
@@ -295,6 +296,29 @@ class NamedSharding(sharding.Sharding):
   def _to_xla_hlo_sharding(self, num_dimensions: int) -> xc.HloSharding:
     return named_sharding_to_xla_hlo_sharding(self, num_dimensions)
 
+  # TODO(bartchr): can't add type annotations due to cyclic dependency.
+  def _to_sdy_sharding(
+      self, ctx, num_dimensions: int
+  ):
+    with ctx.context:
+      dim_shardings = [
+          sdy.DimensionShardingAttr.get([], is_closed=True)
+      ] * num_dimensions
+      for i, dim_spec in enumerate(self._parsed_pspec):
+        if dim_spec is None:
+          dim_shardings[i] = sdy.DimensionShardingAttr.get([], is_closed=False)
+        elif not dim_spec:
+          # Already empty and closed sharding.
+          pass
+        else:
+          dim_shardings[i] = sdy.DimensionShardingAttr.get(
+              [sdy.AxisRefAttr.get(axis[0]) for axis in dim_spec],
+              is_closed=True,
+          )
+      return sdy.TensorShardingAttr.get(
+          'mesh', dim_shardings, replicated_axes=[]
+      )
+
 
 @util.cache(max_size=128, trace_context_in_key=False)
 def get_replicated_hlo_sharding():
@@ -362,6 +386,16 @@ class SingleDeviceSharding(sharding.Sharding):
 
   def _to_xla_hlo_sharding(self, num_dimensions: int) -> xc.HloSharding:
     return get_replicated_hlo_sharding()
+
+  # TODO(bartchr): can't add type annotations due to cyclic dependency.
+  def _to_sdy_sharding(
+      self, ctx, num_dimensions: int
+  ):
+    return sdy.TensorShardingAttr.get(
+        'mesh',
+        [sdy.DimensionShardingAttr.get([], is_closed=True)] * num_dimensions,
+        replicated_axes=[],
+    )
 
   @property
   def is_fully_replicated(self) -> bool:
@@ -494,6 +528,9 @@ class PmapSharding(sharding.Sharding):
 
   def _to_xla_hlo_sharding(self, num_dimensions: int) -> xc.HloSharding:
     raise NotImplementedError("pmap doesn't use OpSharding.")
+
+  def _to_sdy_sharding(self, num_dimensions: int) -> xc.HloSharding:
+    raise NotImplementedError("pmap doesn't use sdy.TensorShardingAttr.")
 
   @functools.cached_property
   def is_fully_replicated(self) -> bool:

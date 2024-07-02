@@ -126,6 +126,11 @@ class Sharding:
   def _to_xla_hlo_sharding(self, num_dimensions: int) -> xc.HloSharding:
     raise NotImplementedError('Subclasses should implement this method.')
 
+  # TODO(bartchr): can't add type annotations due to cyclic dependency.
+  def _to_sdy_sharding(
+      self, ctx, num_dimensions: int
+  ):
+    raise NotImplementedError('Subclasses should implement this method.')
 
   #############################################################################
   # Default implementations below that all subclasses will inherit.

@@ -1957,10 +1957,11 @@ def _cached_lowering_to_hlo(closed_jaxpr, api_name, fun_name, backend,
                             inout_aliases: None | tuple[None | int, ...],
                             propagated_out_mem_kinds: tuple[None | str, ...],
                             platforms: tuple[str, ...],
+                            mesh_shape: tuple[tuple[str, int], ...],
                             lowering_parameters: mlir.LoweringParameters):
   jaxpr = closed_jaxpr.jaxpr
-  in_shardings = semantic_in_shardings._gspmd_shardings
-  out_shardings = semantic_out_shardings._gspmd_shardings
+  in_shardings = semantic_in_shardings.shardings
+  out_shardings = semantic_out_shardings.shardings
   global_in_avals = closed_jaxpr.in_avals
   global_out_avals = closed_jaxpr.out_avals
 
@@ -2033,7 +2034,8 @@ def _cached_lowering_to_hlo(closed_jaxpr, api_name, fun_name, backend,
         all_default_mem_kind=all_default_mem_kind,
         input_output_aliases=inout_aliases,
         propagated_out_mem_kinds=propagated_out_mem_kinds,
-        lowering_parameters=lowering_parameters)
+        lowering_parameters=lowering_parameters,
+        mesh_shape=mesh_shape)
   tuple_args = dispatch.should_tuple_args(len(global_in_avals), backend.platform)
   unordered_effects = list(
       effects.ordered_effects.filter_not_in(closed_jaxpr.effects))
@@ -2283,6 +2285,18 @@ def lower_sharding_computation(
   semantic_out_shardings = SemanticallyEqualShardings(
       out_shardings, global_out_avals)  # type: ignore
   prim_requires_devices = dispatch.jaxpr_has_prim_requiring_devices(jaxpr)
+  # NOTE: _get_and_check_device_assignment already verified all meshes are the
+  # same shape.
+  mesh_shape = None
+  if jax.config.read("jax_sdy_lower"):
+    for sharding in in_shardings:
+      if isinstance(sharding, sharding_impls.NamedSharding):
+        mesh_shape = sharding.mesh.shape_tuple
+        break
+    for sharding in out_shardings:
+      if isinstance(sharding, sharding_impls.NamedSharding):
+        mesh_shape = sharding.mesh.shape_tuple
+        break
 
   (module, keepalive, host_callbacks, unordered_effects, ordered_effects,
    nreps, tuple_args, shape_poly_state) = _cached_lowering_to_hlo(
@@ -2290,7 +2304,7 @@ def lower_sharding_computation(
        semantic_out_shardings, in_layouts, out_layouts, len(da_object),
        tuple(da_object) if prim_requires_devices else None, donated_invars,
        name_stack, all_default_mem_kind, inout_aliases,
-       propagated_out_mem_kinds, platforms,
+       propagated_out_mem_kinds, platforms, mesh_shape,
        lowering_parameters=lowering_parameters)
 
   # backend and device_assignment is passed through to MeshExecutable because
@@ -2527,6 +2541,11 @@ class MeshComputation(stages.XlaLowering):
     return self._hlo
 
   def compile(self, compiler_options=None) -> MeshExecutable:
+    if jax.config.read("jax_sdy_lower"):
+      compiler_options = compiler_options or jax.stages.CompilerOptions()
+      compiler_options["xla_use_shardonnay"] = jax.config.read(
+          "jax_sdy_lower"
+      )
     if self._executable is None or compiler_options is not None:
       executable = UnloadedMeshExecutable.from_hlo(
           self._name, self._hlo, **self.compile_args,

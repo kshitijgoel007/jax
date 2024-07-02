@@ -13,14 +13,16 @@
 # limitations under the License.
 
 # ruff: noqa: F401
+# NOTE: this should be mlir.dialects
 import jaxlib.mlir.dialects.arith as arith
 import jaxlib.mlir.dialects.builtin as builtin
+import jaxlib.mlir.dialects.func as func
 import jaxlib.mlir.dialects.chlo as chlo
 import jaxlib.mlir.dialects.math as math
 import jaxlib.mlir.dialects.memref as memref
 import jaxlib.mlir.dialects.mhlo as mhlo
-import jaxlib.mlir.dialects.func as func
 import jaxlib.mlir.dialects.scf as scf
+import jaxlib.mlir.dialects.sdy as sdy
 import jaxlib.mlir.dialects.sparse_tensor as sparse_tensor
 import jaxlib.mlir.dialects.vector as vector
 try:

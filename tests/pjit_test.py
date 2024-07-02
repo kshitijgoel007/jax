@@ -1302,6 +1302,11 @@ class CustomPartitionerTest(jtu.JaxTestCase):
   def skip_if_custom_partitioning_not_supported(self):
     if jtu.is_cloud_tpu():
       raise unittest.SkipTest("Custom partitioning is not supported on libtpu.")
+    if jax.config.read('jax_sdy_lower'):
+      # DO_NOT_SUBMIT(bartchr): refer to a buganizer here?
+      raise unittest.SkipTest(
+          'Custom partitioning is not implemented by Shardy yet.'
+      )
 
   @jtu.skip_on_devices('cpu')  # Collectives don't seem to work on CPU.
   @jtu.with_mesh([('x', 4), ('y', 2)])
@@ -3299,6 +3304,8 @@ class ArrayPjitTest(jtu.JaxTestCase):
 
   @jtu.with_mesh([('x', 2), ('y', 1)])
   def test_jit_nested_xmap_lower_arg_info(self):
+    if jax.config.read('jax_sdy_lower'):
+      raise self.skipTest("Can't use Shardy with xmap.")
     def f(x, y, *args):
       out = xmap(lambda x: x * 2, in_axes=['i', ...], out_axes=['i', ...],
                axis_resources={'i': 'y'})(jnp.arange(8.))
