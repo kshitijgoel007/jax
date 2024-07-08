@@ -16,20 +16,35 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 from typing import Any
 import warnings
 
 import jax
 from jax import core as jax_core
+from jax._src import config
 from jax._src import core as jax_src_core
 from jax._src import sharding_impls
 from jax._src.interpreters import mlir
 from jax._src.lib.mlir import ir
 from jax._src.pallas import core
 from jax._src.pallas.mosaic import lowering
+from jax._src.pallas.mosaic import verification
 from jax._src.pallas.pallas_call import pallas_call_p
 from jax.experimental import mosaic
 from jax.experimental.mosaic.dialects import tpu
+
+
+_DUMP_PROMELA_TO = config.string_flag(
+    "jax_pallas_dump_promela_to",
+    default=os.getenv("JAX_PALLAS_DUMP_PROMELA_TO", ""),
+    help=(
+        "If set, dumps a Promela model of the kernel to the specified"
+        " directory. The model can verify that the kernel is free of data"
+        " races, deadlocks, etc."
+    ),
+)
 
 
 def pallas_call_tpu_lowering_rule(
@@ -95,6 +110,30 @@ def pallas_call_tpu_lowering_rule(
   # (e.g. PRNG key -> uint32[2])
   physical_avals = [jax_src_core.physical_aval(aval) for aval in ctx.avals_in]
   ctx = ctx.replace(avals_in=physical_avals)
+
+  if promela_dump_path := _DUMP_PROMELA_TO.value:
+    num_devices = 1 if mesh is None else mesh.devices.size
+    num_cores = jax.devices()[0].num_cores
+    model = verification.export_promela_model(
+        mosaic_module, num_devices, num_cores
+    )
+    if promela_dump_path == "stdout":
+      print(model)
+    else:
+      if promela_dump_path == "sponge":
+        promela_dump_path = os.getenv("TEST_UNDECLARED_OUTPUTS_DIR", None)
+        if promela_dump_path is None:
+          raise ValueError(
+              "TEST_UNDECLARED_OUTPUTS_DIR must be set when"
+              " --jax_pallas_dump_promela_to=sponge"
+          )
+        dump_ctx = tempfile.NamedTemporaryFile(
+            mode="w", prefix=name + "-", suffix=".pml", dir=promela_dump_path, delete=False,
+        )
+      else:
+        dump_ctx = open(promela_dump_path, "w")
+      with dump_ctx as f:
+        f.write(model)
 
   def _lower_fun(*args):
     # Dynamic grid bounds have to go at the front.

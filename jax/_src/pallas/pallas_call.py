@@ -962,29 +962,24 @@ def _pallas_call_lowering(
   def tpu_lowering(ctx: mlir.LoweringRuleContext,
                    *in_nodes: mlir.ir.Value | Sequence[mlir.ir.Value],
                    **params):
-    try:
-      from jax._src.pallas.mosaic import pallas_call_registration
-    except ImportError:
+    if mosaic_tpu_backend is None:
       raise _unsupported_lowering_error("tpu")
-    else:
-      return pallas_call_registration.pallas_call_tpu_lowering_rule(
-          ctx, *in_nodes, **params
-      )
+    return mosaic_tpu_backend.pallas_call_tpu_lowering_rule(
+        ctx, *in_nodes, **params
+    )
 
   def gpu_lowering(ctx: mlir.LoweringRuleContext,
                    *in_nodes: mlir.ir.Value | Sequence[mlir.ir.Value],
                    **params):
-    try:
-      if _PALLAS_USE_MOSAIC_GPU.value:
-        from jax._src.pallas.mosaic_gpu import pallas_call_registration
-      else:
-        from jax._src.pallas.triton import pallas_call_registration  # type: ignore
-    except ImportError:
-      raise _unsupported_lowering_error("gpu")
+    if _PALLAS_USE_MOSAIC_GPU.value:
+      backend = mosaic_gpu_backend
     else:
-      return pallas_call_registration.pallas_call_lowering(
-          ctx, *in_nodes, **params
-      )
+      backend = triton_backend
+    if backend is None:
+      raise _unsupported_lowering_error("gpu")
+    return backend.pallas_call_lowering(
+        ctx, *in_nodes, **params
+    )
 
   return mlir.lower_per_platform(ctx, "pallas_call",
                                  dict(cpu=cpu_lowering,
@@ -1119,3 +1114,23 @@ def pallas_call(
     out = tree_util.tree_unflatten(out_tree, out_flat)
     return out
   return wrapped
+
+
+# We import backends at the top level in case they want to define flags, but we
+# can only do that at the bottom of this file, beacuse some of them depend on
+# this module already being initialized.
+
+try:
+  from jax._src.pallas.mosaic import pallas_call_registration as mosaic_tpu_backend
+except ImportError:
+  mosaic_tpu_backend = None
+
+try:
+  from jax._src.pallas.mosaic_gpu import pallas_call_registration as mosaic_gpu_backend
+except ImportError:
+  mosaic_gpu_backend = None
+
+try:
+  from jax._src.pallas.triton import pallas_call_registration as triton_backend  # type: ignore
+except ImportError:
+  triton_backend = None

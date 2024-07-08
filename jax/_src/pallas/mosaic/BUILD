@@ -34,6 +34,19 @@ py_library(
 )
 
 py_library(
+    name = "verification",
+    srcs = ["verification.py"],
+    deps = [
+        "//jax",
+        "//jax/_src/lib",
+        "//third_party/py/mlir:arithmetic_dialect",
+        "//third_party/py/mlir:func_dialect",
+        "//third_party/py/mlir:ir",
+        "//third_party/py/mlir:pass_manager",
+    ],
+)
+
+py_library(
     name = "primitives",
     srcs = ["primitives.py"],
     deps = [

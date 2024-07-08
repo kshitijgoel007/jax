@@ -20,9 +20,11 @@ from __future__ import annotations
 import base64
 import collections.abc
 from collections.abc import Callable, Sequence
+import contextlib
 import dataclasses
 import functools
 import io
+import itertools
 import os
 import time
 from typing import Any
