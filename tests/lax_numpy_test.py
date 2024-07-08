@@ -5539,6 +5539,20 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
         np_fun, jnp_fun, args_maker, check_dtypes=False)
     self._CompileAndCheck(jnp_fun, args_maker)
 
+  @jtu.sample_product(
+    dtype=inexact_dtypes,
+  )
+  def testGradientNonConstant(self, dtype):
+    rng = jtu.rand_default(self.rng())
+    shape = (5, 4, 6)
+    varargs = [rng(shape[0], dtype), 0.3, rng(shape[2], dtype)]
+    args_maker = self._GetArgsMaker(rng, [shape], [dtype])
+    jnp_fun = lambda y: jnp.gradient(y, *varargs)
+    np_fun = lambda y: np.gradient(y, *varargs)
+    self._CheckAgainstNumpy(
+        np_fun, jnp_fun, args_maker, check_dtypes=False)
+    self._CompileAndCheck(jnp_fun, args_maker)
+
   def testZerosShapeErrors(self):
     # see https://github.com/google/jax/issues/1822
     self.assertRaisesRegex(

@@ -1188,16 +1188,36 @@ def gradient(f: ArrayLike, *varargs: ArrayLike,
              edge_order: int | None = None) -> Array | list[Array]:
   if edge_order is not None:
     raise NotImplementedError("The 'edge_order' argument to jnp.gradient is not supported.")
-  a, *spacing = util.promote_args_inexact("gradient", f, *varargs)
+  a, spacing = f, varargs
 
   def gradient_along_axis(a, h, axis):
     sliced = partial(lax.slice_in_dim, a, axis=axis)
-    a_grad = concatenate((
-      (sliced(1, 2) - sliced(0, 1)),  # upper edge
-      (sliced(2, None) - sliced(None, -2)) * 0.5,  # inner
-      (sliced(-1, None) - sliced(-2, -1)),  # lower edge
-    ), axis)
-    return a_grad / h
+    upper_edge = sliced(1, 2) - sliced(0, 1)
+    lower_edge = sliced(-1, None) - sliced(-2, -1)
+    is_distance_array = bool(ndim(h))
+    if is_distance_array:
+      if h.ndim != 1:
+        raise ValueError("Spacing arrays must be 1D.")
+      h_shape = [1] * a.ndim
+      h_shape[axis] = len(h)
+      h = h.reshape(h_shape)
+      sliced_x = partial(lax.slice_in_dim, h, axis=axis)
+
+      upper_edge /= sliced_x(1, 2) - sliced_x(0, 1)
+      lower_edge /= sliced_x(-1, None) - sliced_x(-2, -1)
+      dx1 = sliced_x(1, -1) - sliced_x(0, -2)
+      dx2 = sliced_x(2, None) - sliced_x(1, -1)
+      a = -(dx2) / (dx1 * (dx1 + dx2))
+      b = (dx2 - dx1) / (dx1 * dx2)
+      c = dx1 / (dx2 * (dx1 + dx2))
+      inner = a * sliced(0, -2) + b * sliced(1, -1) + c * sliced(2, None)
+    else:
+      inner = (sliced(2, None) - sliced(None, -2)) * 0.5
+
+    a_grad = concatenate((upper_edge, inner, lower_edge), axis=axis)
+    if not is_distance_array:
+      a_grad /= h
+    return a_grad
 
   if axis is None:
     axis_tuple = tuple(range(a.ndim))
@@ -1218,9 +1238,6 @@ def gradient(f: ArrayLike, *varargs: ArrayLike,
     dx = list(spacing)
   else:
     TypeError(f"Invalid number of spacing arguments {len(spacing)} for {axis=}")
-
-  if ndim(dx[0]) != 0:
-    raise NotImplementedError("Non-constant spacing not implemented")
 
   a_grad = [gradient_along_axis(a, h, ax) for ax, h in zip(axis_tuple, dx)]
   return a_grad[0] if len(axis_tuple) == 1 else a_grad
