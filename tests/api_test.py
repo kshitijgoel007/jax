@@ -1932,6 +1932,22 @@ class APITest(jtu.JaxTestCase):
       x = api.device_put(val, device=cpu_device)
       self.assertEqual(x.devices(), {cpu_device})
 
+  def test_device_put_on_donated_buffer_fails(self):
+    @partial(jax.jit, donate_argnums=0)
+    def f(inp1):
+      return inp1 * 2
+
+    x = jnp.zeros((10,), jnp.float32)
+    f(x)
+
+    with self.assertRaises(RuntimeError):
+      result = jax.device_put(x, jax.devices()[0])
+      result.block_until_ready()
+
+    with self.assertRaises(RuntimeError):
+      result = jax.device_put(x, jax.devices()[-1])
+      result.block_until_ready()
+
   @jax.default_matmul_precision("float32")
   def test_jacobian(self):
     R = self.rng().randn

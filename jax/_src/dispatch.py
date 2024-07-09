@@ -363,6 +363,7 @@ def _different_device_order_reshard(x, target_sharding):
     )
     new_hlo_sharding = xc.HloSharding.from_proto(new_op_sharding)
 
+  x._check_if_deleted()
   new_x = array.make_array_from_single_device_arrays(
       x.shape,
       GSPMDSharding(target_sharding._device_assignment, new_hlo_sharding,
