@@ -8,17 +8,21 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 // NOLINTNEXTLINE(misc-include-cleaner)
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "llvm/ADT/StringMap.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LogicalResult.h"
-#include "llvm/ADT/StringMap.h"
+#include "absl/log/check.h"
+#include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/include/mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/include/mlir/Dialect/Vector/Transforms/VectorTransforms.h"
 #include "mlir/include/mlir/IR/AffineExpr.h"
 #include "mlir/include/mlir/IR/Block.h"
 #include "mlir/include/mlir/IR/Builders.h"
 #include "mlir/include/mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/include/mlir/IR/OpDefinition.h"
 #include "mlir/include/mlir/IR/Operation.h"
 #include "mlir/include/mlir/IR/Region.h"
+#include "mlir/include/mlir/IR/Value.h"
 #include "mlir/include/mlir/Support/LLVM.h"
 #include "jaxlib/mosaic/dialect/tpu/tpu_dialect.h"
 
@@ -33,24 +37,126 @@ LogicalResult tpu_matmul_rule(tpu::MatmulOp op) {
 
   auto lhs = op.getLhs();
   auto rhs = op.getRhs();
+  auto acc = op.getAcc();
 
   const VectorType lhs_ty = lhs.getType();
   const VectorType rhs_ty = rhs.getType();
+  const VectorType acc_ty = acc.getType();
 
   auto lhs_element_type = lhs_ty.getElementType();
   auto rhs_element_type = rhs_ty.getElementType();
+  auto acc_element_type = acc_ty.getElementType();
+
+  auto extsi_sitofp = [&builder, &op](TypedValue<VectorType> element) {
+    const VectorType ty = element.getType();
+    auto shape = ty.getShape();
+    CHECK(ty.getElementType().isInteger());
+    TypedValue<VectorType> ext_ele;
+    if (ty.getElementType().getIntOrFloatBitWidth() == 32) {
+      ext_ele = element;
+    } else {
+      ext_ele = cast<TypedValue<VectorType>>(
+          builder
+              .create<arith::ExtSIOp>(
+                  VectorType::get(shape, builder.getI32Type()), element)
+              .getResult());
+    }
+    // TODO(mvoz): Go to bf16 when hardware supported, requires adding support
+    // for 16 bitwidth in extsiop in infer/apply.
+    auto ele_as_fp = builder.create<arith::SIToFPOp>(
+        op.getLoc(), VectorType::get(shape, builder.getF32Type()), ext_ele);
+    return ele_as_fp;
+  };
 
   if (lhs_element_type != rhs_element_type) {
-    if (lhs_element_type.isInteger() || rhs_element_type.isInteger()) {
-      op->emitOpError("Mix int/float or different int/int - NYI");
+    if (lhs_element_type.isInteger() && rhs_element_type.isInteger()) {
+      // TODO(mvoz): Add support for mixed int/int matmul.
+      op->emitOpError("Mix int/int - NYI");
       return failure();
     }
+    if (acc_element_type.isInteger()) {
+      // TODO(mvoz): Add support for mixed int/float matmul with int acc.
+      // Should be pretty straightforward.
+      op->emitOpError("acc is int in mixed matmul - NYI");
+      return failure();
+    }
+    if (lhs_element_type.isInteger()) {
+      auto float_lhs = extsi_sitofp(lhs);
+      op->setOperand(0, float_lhs);
+    }
+    if (rhs_element_type.isInteger()) {
+      auto float_rhs = extsi_sitofp(rhs);
+      op->setOperand(1, float_rhs);
+    }
   }
-  // TODO(voz): Add more invariants.
-  // TODO(voz): Insert extf/ sitof/ etc ops to cast the operands to the
-  // correct type for mixed matmul cases.
+  // TODO(mvoz): Add more invariants.
+  if (acc_element_type.isInteger()) {
+    CHECK(op.getLhs().getType().getElementType().isInteger());
+    CHECK(op.getRhs().getType().getElementType().isInteger());
+  } else {
+    CHECK(!op.getLhs().getType().getElementType().isInteger());
+    CHECK(!op.getRhs().getType().getElementType().isInteger());
+  }
   return success();
 };
+
+// TODO(mvoz): If # of args before op grows > 2, we should consider creating
+// a ctx object to pass around. A little overkill for now.
+template <typename Op>
+LogicalResult canonicalize_binops(int hardware_generation_, Op &op) {
+  if (op.getNumOperands() != 2) {
+    op.emitOpError("Invariant violated: Not a binary op");
+    return failure();
+  }
+  auto lhs = op.getOperand(0);
+  auto rhs = op.getOperand(1);
+  auto lhs_ty = dyn_cast<VectorType>(lhs.getType());
+  if (!lhs_ty) {
+    op.emitOpError("Invariant violated: Not a vector");
+    return failure();
+  }
+  auto rhs_ty = dyn_cast<VectorType>(rhs.getType());
+  if (!rhs_ty) {
+    op.emitOpError("Invariant violated: Not a vector");
+    return failure();
+  }
+  auto lhs_element_type = lhs_ty.getElementType();
+  auto rhs_element_type = rhs_ty.getElementType();
+  if (lhs_element_type != rhs_element_type) {
+    op.emitOpError("NYI - mixed type elementwise ops");
+    return failure();
+  }
+  if ((!lhs_element_type.isF32() && !lhs_element_type.isBF16()) ||
+      (!rhs_element_type.isF32() && !rhs_element_type.isBF16())) {
+    op.emitOpError("NYI - non fp32/bf16 elementwise ops");
+    return failure();
+  }
+  // bf16 is not supported in earlier hardware.
+  if (hardware_generation_ <= 5) {
+    // TODO(mvoz): Once we support mixed type elementwise ops, we need to
+    // check a little more carefully here.
+    if (lhs_element_type.isBF16() && rhs_element_type.isBF16()) {
+      OpBuilder builder(op);
+      auto target_f32_ty =
+          VectorType::get(lhs_ty.getShape(), builder.getF32Type());
+      auto target_bf16_ty =
+          VectorType::get(rhs_ty.getShape(), builder.getBF16Type());
+      auto target_f32_lhs =
+          builder.create<arith::ExtFOp>(op.getLoc(), target_f32_ty, lhs)
+              .getResult();
+      auto target_f32_rhs =
+          builder.create<arith::ExtFOp>(op.getLoc(), target_f32_ty, rhs)
+              .getResult();
+      auto op_in_f32 = builder.create<Op>(op.getLoc(), target_f32_ty,
+                                          target_f32_lhs, target_f32_rhs);
+      auto op_in_bf16 = builder.create<arith::TruncFOp>(
+          op.getLoc(), target_bf16_ty, op_in_f32.getResult());
+      op.replaceAllUsesWith(op_in_bf16.getResult());
+      op.erase();
+    }
+  }
+  return success();
+}
 
 LogicalResult canonicalize_matmul(Operation &op) {
   auto matmul_op = dyn_cast<tpu::MatmulOp>(op);
@@ -139,7 +245,10 @@ const llvm::StringMap<canonicalize_rule_type> &rules() {
 
 class MosaicCanonicalizer {
  public:
-  MosaicCanonicalizer() {}
+  MosaicCanonicalizer(int hardware_generation)
+      : hardware_generation_(hardware_generation) {}
+
+  int hardware_generation_;
 
   LogicalResult canonicalize(func::FuncOp op) {
     if (!op.getBody().hasOneBlock()) {
@@ -170,6 +279,37 @@ class MosaicCanonicalizer {
         }
       }
     }
+    if (OpTrait::hasElementwiseMappableTraits(&any_op)) {
+      // Is this the worst way of doing it .... ever? I would absolutely love
+      // to be able to template on the op type somehow, but MLIR
+      // has all this jank runtime casting stuff instead of proper
+      // specialization, so I am unsure if we can do this.
+      if (auto binop = dyn_cast<arith::MulFOp>(any_op)) {
+        if (canonicalize_binops(hardware_generation_, binop).failed()) {
+          return failure();
+        }
+      } else if (auto binop = dyn_cast<arith::DivFOp>(any_op)) {
+        if (canonicalize_binops(hardware_generation_, binop).failed()) {
+          return failure();
+        }
+      } else if (auto binop = dyn_cast<arith::AddFOp>(any_op)) {
+        if (canonicalize_binops(hardware_generation_, binop).failed()) {
+          return failure();
+        }
+      } else if (auto binop = dyn_cast<arith::SubFOp>(any_op)) {
+        if (canonicalize_binops(hardware_generation_, binop).failed()) {
+          return failure();
+        }
+      } else if (auto binop = dyn_cast<arith::MaximumFOp>(any_op)) {
+        if (canonicalize_binops(hardware_generation_, binop).failed()) {
+          return failure();
+        }
+      } else if (auto binop = dyn_cast<arith::MinimumFOp>(any_op)) {
+        if (canonicalize_binops(hardware_generation_, binop).failed()) {
+          return failure();
+        }
+      }
+    }
     if (auto rule_it = rules().find(any_op.getName().getStringRef());
         rule_it != rules().end()) {
       const canonicalize_rule_type &rule = rule_it->getValue();
@@ -181,19 +321,23 @@ class MosaicCanonicalizer {
 
 struct CanonicalizeMosaicPass
     : public impl::CanonicalizeMosaicPassBase<CanonicalizeMosaicPass> {
-  CanonicalizeMosaicPass() {}
+  CanonicalizeMosaicPass(int hardware_generation)
+      : hardware_generation_(hardware_generation) {}
+
+  int hardware_generation_;
 
   void runOnOperation() override {
     func::FuncOp func = getOperation();
-    MosaicCanonicalizer vlc;
+    MosaicCanonicalizer vlc(hardware_generation_);
     if (vlc.canonicalize(func).failed()) {
       signalPassFailure();
     }
   };
 };
 
-std::unique_ptr<OperationPass<func::FuncOp>> createCanonicalizeMosaicPass() {
-  return std::make_unique<CanonicalizeMosaicPass>();
+std::unique_ptr<OperationPass<func::FuncOp>> createCanonicalizeMosaicPass(
+    int hardware_generation) {
+  return std::make_unique<CanonicalizeMosaicPass>(hardware_generation);
 }
 
 }  // namespace mlir::tpu
